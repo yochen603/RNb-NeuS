@@ -100,7 +100,7 @@ class Runner:
         if self.mode[:5] == 'train':
             self.file_backup()
 
-
+    
     def train_rnb(self):
         self.writer = SummaryWriter(log_dir=os.path.join(self.base_exp_dir, 'logs'))
         self.update_learning_rate()
@@ -111,27 +111,29 @@ class Runner:
             torch.random.manual_seed(iter_i)
             cbn = image_perm[self.iter_step % len(image_perm)]
             data, true_rgb_warmup, true_rgb, pixels_x, pixels_y = self.dataset.ps_gen_random_rays_at_view_on_all_lights(cbn, self.batch_size)
-
+    
             rays_o, rays_d, mask = data[:, :3], data[:, 3: 6], data[:, 6: 7]
             near, far = self.dataset.near_far_from_sphere(rays_o, rays_d)
-
+            z_vals = self.dataset.get_z_vals(rays_o, rays_d, near, far)
+            z_vals = z_vals.reshape(-1, z_vals.shape[-1])  # Reshape z_vals to (batch_size, n_samples)
+    
             background_rgb = None
             if self.use_white_bkgd:
                 background_rgb = torch.ones([1, 3])
-
+    
             if self.mask_weight > 0.0:
                 mask = (mask > 0.5).float()
             else:
                 mask = torch.ones_like(mask)
             mask_sum = mask.sum() + 1e-5
-
+    
             if self.iter_step < self.warm_up_iter:
                 true_rgb = true_rgb_warmup
-
+    
                 lights_dir = self.dataset.light_directions_warmup[cbn, :, :].cuda()
                 lights_dir = lights_dir.reshape(self.dataset.n_lights,1,1,3)
-
-                render_out = self.renderer.render_rnb_warmup(rays_o, rays_d, near, far, lights_dir,
+    
+                render_out = self.renderer.render_rnb_warmup(rays_o, rays_d, z_vals, lights_dir,
                                 background_rgb=background_rgb,
                                 cos_anneal_ratio=self.get_cos_anneal_ratio(),
                                 no_albedo=self.no_albedo)
@@ -139,8 +141,8 @@ class Runner:
             else:
                 lights_dir = self.dataset.light_directions[cbn, :, pixels_y, pixels_x, :].cuda() # [n_lights, batch_size, 3]
                 lights_dir = lights_dir.reshape(self.dataset.n_lights,self.batch_size,1,3)
-
-                render_out = self.renderer.render_rnb(rays_o, rays_d, near, far, lights_dir,
+    
+                render_out = self.renderer.render_rnb(rays_o, rays_d, z_vals, lights_dir,
                                 background_rgb=background_rgb,
                                 cos_anneal_ratio=self.get_cos_anneal_ratio(),
                                 no_albedo=self.no_albedo)
@@ -152,24 +154,23 @@ class Runner:
             weight_max = render_out['weight_max']
             weight_sum = render_out['weight_sum']
             normal = render_out['gradients']
-
+    
             # Loss
-            color_error = ((color_fine - true_rgb) * mask[None, :, :]).reshape(-1, self.color_depth)
-            # psnr = 20.0 * torch.log10(1.0 / (((color_fine - true_rgb)**2 *  mask[None, :, :]).sum() / ( mask[None, :, :] * 3.0)).sqrt())
+            color_error = ((color_fine - true_rgb) * mask[None, :, :]).reshape(-1, 3)
             color_fine_loss = F.l1_loss(color_error, torch.zeros_like(color_error), reduction='sum') / (mask_sum*self.dataset.n_lights)
-
+    
             eikonal_loss = gradient_error
-
+    
             mask_loss = F.binary_cross_entropy(weight_sum.clip(1e-3, 1.0 - 1e-3), mask)
-
+    
             loss = color_fine_loss +\
                    eikonal_loss * self.igr_weight +\
-                   mask_loss * self.mask_weight # 4 * self.mask_weight ??????????????
-
+                   mask_loss * self.mask_weight
+    
             self.optimizer.zero_grad()
             loss.backward()
             self.optimizer.step()
-
+    
             self.iter_step += 1
             
             self.writer.add_scalar('Loss/loss', loss, self.iter_step)
@@ -178,8 +179,7 @@ class Runner:
             self.writer.add_scalar('Statistics/s_val', s_val.mean(), self.iter_step)
             self.writer.add_scalar('Statistics/cdf', (cdf_fine[:, :1] * mask).sum() / mask_sum, self.iter_step)
             self.writer.add_scalar('Statistics/weight_max', (weight_max * mask).sum() / mask_sum, self.iter_step)
-            # self.writer.add_scalar('Statistics/psnr', psnr, self.iter_step)
-
+    
             if self.iter_step % self.report_freq == 0:
                 print(self.base_exp_dir)
                 print('iter:{:8>d} \nloss = {} \ncolor_loss={} \neikonal_loss={} \nmask_loss={} \nlr={}\n'.format(self.iter_step, loss,
@@ -190,15 +190,15 @@ class Runner:
                 
             if self.iter_step % self.save_freq == 0:
                 self.save_checkpoint()
-
+    
             if self.iter_step % self.val_freq == 0:
                 self.validate_image()
-
+    
             if self.iter_step % self.val_mesh_freq == 0:
                 self.validate_mesh()
-
+    
             self.update_learning_rate()
-
+    
             if self.iter_step % len(image_perm) == 0:
                 image_perm = self.get_image_perm()
 
@@ -259,14 +259,15 @@ class Runner:
         os.makedirs(os.path.join(self.base_exp_dir, 'checkpoints'), exist_ok=True)
         torch.save(checkpoint, os.path.join(self.base_exp_dir, 'checkpoints', 'ckpt_{:0>6d}.pth'.format(self.iter_step)))
 
+
     def validate_image(self, idv=-1, idl=-1, resolution_level=-1):
         if idv < 0:
             idv = np.random.randint(self.dataset.n_images)
         if idl < 0:
             idl = np.random.randint(self.dataset.n_lights)
-
+    
         print('Validate: iter: {}, camera: {}, light: {}'.format(self.iter_step, idv, idl))
-
+    
         if resolution_level < 0:
             resolution_level = self.validate_resolution_level
         rays_o, rays_d, pixels_x, pixels_y = self.dataset.gen_rays_at(idv, resolution_level=resolution_level)
@@ -274,41 +275,43 @@ class Runner:
         
         pixels_x = pixels_x.round().long()
         pixels_y = pixels_y.round().long()
-
+    
         rays_o = rays_o.reshape(-1, 3).split(self.batch_size)
         rays_d = rays_d.reshape(-1, 3).split(self.batch_size)
         pixels_x = pixels_x.reshape(-1, 1).split(self.batch_size)
         pixels_y = pixels_y.reshape(-1, 1).split(self.batch_size)
-
+    
         out_rgb_fine = []
         out_normal_fine = []
-
+    
         for rays_o_batch, rays_d_batch, pixels_x_batch, pixels_y_batch in zip(rays_o, rays_d, pixels_x, pixels_y):
             near, far = self.dataset.near_far_from_sphere(rays_o_batch, rays_d_batch)
+            z_vals = self.dataset.get_z_vals(rays_o_batch, rays_d_batch, near, far)
+            z_vals = z_vals.reshape(-1, z_vals.shape[-1])  # Reshape z_vals to (batch_size, n_samples)
             background_rgb = torch.ones([1, 3]) if self.use_white_bkgd else None
-
+    
             if self.iter_step < self.warm_up_iter:
                 lights_dir = self.dataset.light_directions_warmup[idv, idl, :].cuda()
                 lights_dir = lights_dir.reshape(1,1,1,3)
-
-                render_out = self.renderer.render_rnb_warmup(rays_o_batch, rays_d_batch, near, far, lights_dir,
+    
+                render_out = self.renderer.render_rnb_warmup(rays_o_batch, rays_d_batch, z_vals, lights_dir,
                                 background_rgb=background_rgb,
                                 cos_anneal_ratio=self.get_cos_anneal_ratio(),
                                 no_albedo=self.no_albedo)
                 
             else:
                 lights_dir = self.dataset.light_directions[idv, idl, pixels_y_batch, pixels_x_batch, :].cuda().unsqueeze(0)
-                render_out = self.renderer.render_rnb(rays_o_batch, rays_d_batch, near, far, lights_dir,
+                render_out = self.renderer.render_rnb(rays_o_batch, rays_d_batch, z_vals, lights_dir,
                                 background_rgb=background_rgb,
                                 cos_anneal_ratio=self.get_cos_anneal_ratio(),
                                 no_albedo=self.no_albedo)
-
+    
             def feasible(key): return (key in render_out) and (render_out[key] is not None)
-
+    
             if feasible('color_fine'):
                 out_rgb_fine.append(render_out['color_fine'].squeeze(0).detach().cpu().numpy())
             if feasible('gradients') and feasible('weights'):
-                n_samples = self.renderer.n_samples + self.renderer.n_importance
+                n_samples = z_vals.shape[-1]  # Use the number of samples from z_vals
                 normals = render_out['gradients'] * render_out['weights'][:, :n_samples, None]
                 if feasible('inside_sphere'):
                     normals = normals * render_out['inside_sphere'][..., None]
@@ -316,21 +319,21 @@ class Runner:
                 out_normal_fine.append(normals)
             del render_out
 
+    
         img_fine = None
         if len(out_rgb_fine) > 0:
             img_fine = np.concatenate(out_rgb_fine, axis=0).reshape([H, W, 3, -1])
-
+    
         normal_img = None
         if len(out_normal_fine) > 0:
             normal_img = np.concatenate(out_normal_fine, axis=0).reshape([H, W, 3, -1])
-
+    
         os.makedirs(os.path.join(self.base_exp_dir, 'validations_fine'), exist_ok=True)
         os.makedirs(os.path.join(self.base_exp_dir, 'normals'), exist_ok=True)
-
+    
         for i in range(img_fine.shape[-1]):
             if len(out_rgb_fine) > 0:
                 if self.iter_step < self.warm_up_iter:
-
                     save_image(os.path.join(self.base_exp_dir,
                                             'validations_fine',
                                             '{:0>8d}_{}_{}_{}.png'.format(self.iter_step, i, idv, idl)),

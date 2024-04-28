@@ -173,6 +173,7 @@ class Dataset:
         object_bbox_max = np.linalg.inv(self.scale_mats_np[0]) @ object_scale_mat @ object_bbox_max[:, None]
         self.object_bbox_min = object_bbox_min[:3, 0]
         self.object_bbox_max = object_bbox_max[:3, 0]
+        self.density_scale = self.conf.get_float('density_scale', default=1.0)
 
         print('Load data: End')
     
@@ -277,7 +278,14 @@ class Dataset:
         rays_v = p / torch.linalg.norm(p, ord=2, dim=-1, keepdim=True)    # batch_size, 3
         rays_v = torch.matmul(self.pose_all[img_idx, None, :3, :3], rays_v[:, :, None]).squeeze()  # batch_size, 3
         rays_o = self.pose_all[img_idx, None, :3, 3].expand(rays_v.shape) # batch_size, 3
-        return torch.cat([rays_o.cpu(), rays_v.cpu(), color, mask[:, :1]], dim=-1).cuda()    # batch_size, 10
+        near, far = self.near_far_from_sphere(rays_o, rays_v)
+        z_vals = self.get_z_vals(rays_o, rays_v, near, far)
+        return torch.cat([rays_o.cpu(), rays_v.cpu(), z_vals.cpu(), color, mask[:, :1]], dim=-1).cuda()    # batch_size, 10
+
+    def get_z_vals(self, rays_o, rays_d, near, far, num_steps=128):
+        t_vals = torch.linspace(0.0, 1.0, num_steps, device=rays_o.device)
+        z_vals = near[..., None] * (1.0 - t_vals) + far[..., None] * t_vals
+        return z_vals
 
     def gen_rays_between(self, idx_0, idx_1, ratio, resolution_level=1):
         """

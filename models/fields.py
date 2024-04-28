@@ -18,7 +18,8 @@ class SDFNetwork(nn.Module):
                  scale=1,
                  geometric_init=True,
                  weight_norm=True,
-                 inside_outside=False):
+                 inside_outside=False,
+                 density_scale=10.0):  # Add the density_scale parameter
         super(SDFNetwork, self).__init__()
 
         dims = [d_in] + [d_hidden for _ in range(n_layers)] + [d_out]
@@ -68,6 +69,7 @@ class SDFNetwork(nn.Module):
             setattr(self, "lin" + str(l), lin)
 
         self.activation = nn.Softplus(beta=100)
+        self.density_scale = density_scale  # Add the density_scale attribute
 
     def forward(self, inputs):
         inputs = inputs * self.scale

@@ -85,10 +85,69 @@ class NeuSRenderer:
         self.deviation_network = deviation_network
         self.color_network = color_network
         self.n_samples = n_samples
-        self.n_importance = n_importance
         self.n_outside = n_outside
-        self.up_sample_steps = up_sample_steps
         self.perturb = perturb
+        self.density_scale = sdf_network.density_scale
+
+
+    
+    def render_rnb(self, rays_o, rays_d, z_vals, lights_dir, background_rgb=None, cos_anneal_ratio=0.0, no_albedo=False):
+        batch_size, n_samples = z_vals.shape
+
+        background_alpha = None
+        background_sampled_color = None
+
+        # Background model
+        if self.n_outside > 0:
+            z_vals_feed = torch.cat([z_vals, z_vals_outside], dim=-1)
+            z_vals_feed, _ = torch.sort(z_vals_feed, dim=-1)
+            ret_outside = self.render_core_outside(rays_o, rays_d, z_vals_feed, z_vals_feed[..., 1:] - z_vals_feed[..., :-1], self.nerf)
+
+            background_sampled_color = ret_outside['sampled_color']
+            background_alpha = ret_outside['alpha']
+
+        # Render core
+        ret_fine = self.render_core_mvps(rays_o,
+                                         rays_d,
+                                         z_vals,
+                                         z_vals[..., 1:] - z_vals[..., :-1],
+                                         self.sdf_network,
+                                         self.deviation_network,
+                                         self.color_network,
+                                         background_rgb=background_rgb,
+                                         background_alpha=background_alpha,
+                                         background_sampled_color=background_sampled_color,
+                                         cos_anneal_ratio=cos_anneal_ratio)
+
+        albedo = ret_fine['sampled_albedo']
+        if no_albedo:
+            albedo = torch.ones_like(ret_fine['sampled_albedo'])
+        normal = ret_fine['sampled_normal']
+        weights = ret_fine['weights']
+
+        directions = lights_dir * torch.ones(lights_dir.shape[0], batch_size, n_samples, 3) # n_lights, batch_size, n_samples, 3
+
+        shading_fine = (normal[None,:,:,:] * directions).sum(dim=-1, keepdim=True)
+        color_fine = (albedo[None, :, :, :] * weights[None, :, :, None] * shading_fine).sum(dim=2)
+
+        weights_sum = weights.sum(dim=-1, keepdim=True)
+        gradients = ret_fine['gradients']
+        s_val = ret_fine['s_val'].reshape(batch_size, n_samples).mean(dim=-1, keepdim=True)
+
+        return {
+            'color_fine': color_fine,
+            's_val': s_val,
+            'cdf_fine': ret_fine['cdf'],
+            'weight_sum': weights_sum,
+            'weight_max': torch.max(weights, dim=-1, keepdim=True)[0],
+            'gradients': gradients,
+            'weights': weights,
+            'gradient_error': ret_fine['gradient_error'],
+            'inside_sphere': ret_fine['inside_sphere']
+        }
+
+
+    
 
     def render_core_outside(self, rays_o, rays_d, z_vals, sample_dist, nerf, background_rgb=None):
         """
@@ -219,12 +278,11 @@ class NeuSRenderer:
 
         sdf_nn_output = sdf_network(pts)
         sdf = sdf_nn_output[:, :1]
-        #feature_vector = None
         feature_vector = sdf_nn_output[:, 1:]
 
         gradients = sdf_network.gradient(pts).squeeze()
-        color_data = color_network(pts, gradients, dirs, feature_vector).reshape(batch_size, n_samples, self.color_depth)
-        sampled_color = color_data[:,:,:3]
+        sampled_color = color_network(pts, gradients, dirs, feature_vector).reshape(batch_size, n_samples, 3)
+
         inv_s = deviation_network(torch.zeros([1, 3]))[:, :1].clip(1e-6, 1e6)           # Single parameter
         inv_s = inv_s.expand(batch_size * n_samples, 1)
 
@@ -245,7 +303,7 @@ class NeuSRenderer:
         p = prev_cdf - next_cdf
         c = prev_cdf
 
-        alpha = ((p + 1e-5) / (c + 1e-5)).reshape(batch_size, n_samples).clip(0.0, 1.0)
+        alpha = ((p + 1e-5) / (c + 1e-5)).reshape(batch_size, n_samples).clip(0.0, 1.0) * self.density_scale
 
         pts_norm = torch.linalg.norm(pts, ord=2, dim=-1, keepdim=True).reshape(batch_size, n_samples)
         inside_sphere = (pts_norm < 1.0).float().detach()
@@ -464,81 +522,81 @@ class NeuSRenderer:
         }
 
     def render_core_mvps(self,
-                    rays_o,
-                    rays_d,
-                    z_vals,
-                    sample_dist,
-                    sdf_network,
-                    deviation_network,
-                    color_network,
-                    background_alpha=None,
-                    background_sampled_color=None,
-                    background_rgb=None,
-                    cos_anneal_ratio=0.0):
+                        rays_o,
+                        rays_d,
+                        z_vals,
+                        sample_dist,
+                        sdf_network,
+                        deviation_network,
+                        color_network,
+                        background_alpha=None,
+                        background_sampled_color=None,
+                        background_rgb=None,
+                        cos_anneal_ratio=0.0):
         batch_size, n_samples = z_vals.shape
-
+    
         # Section length
         dists = z_vals[..., 1:] - z_vals[..., :-1]
-        dists = torch.cat([dists, torch.Tensor([sample_dist]).expand(dists[..., :1].shape)], -1)
+        dists = torch.cat([dists, dists[..., -1:]], -1)
         mid_z_vals = z_vals + dists * 0.5
-
+    
         # Section midpoints
         pts = rays_o[:, None, :] + rays_d[:, None, :] * mid_z_vals[..., :, None]  # n_rays, n_samples, 3
         dirs = rays_d[:, None, :].expand(pts.shape)
-
+    
         pts = pts.reshape(-1, 3)
         dirs = dirs.reshape(-1, 3)
-
+    
         sdf_nn_output = sdf_network(pts)
         sdf = sdf_nn_output[:, :1]
-
+    
         #feature_vector = None
         feature_vector = sdf_nn_output[:, 1:]
-
+    
         gradients = sdf_network.gradient(pts).squeeze()
-
+    
         # dirs is given but ignored
         sampled_albedo = color_network(pts, gradients, dirs, feature_vector).reshape(batch_size, n_samples, self.color_depth)
-
+    
         inv_s = deviation_network(torch.zeros([1, 3]))[:, :1].clip(1e-6, 1e6)           # Single parameter
         inv_s = inv_s.expand(batch_size * n_samples, 1)
-
+    
         true_cos = (dirs * gradients).sum(-1, keepdim=True)
-
+    
         # "cos_anneal_ratio" grows from 0 to 1 in the beginning training iterations. The anneal strategy below makes
         # the cos value "not dead" at the beginning training iterations, for better convergence.
         iter_cos = -(F.relu(-true_cos * 0.5 + 0.5) * (1.0 - cos_anneal_ratio) +
                      F.relu(-true_cos) * cos_anneal_ratio)  # always non-positive
-
+    
         # Estimate signed distances at section points
         estimated_next_sdf = sdf + iter_cos * dists.reshape(-1, 1) * 0.5
         estimated_prev_sdf = sdf - iter_cos * dists.reshape(-1, 1) * 0.5
-
+    
         prev_cdf = torch.sigmoid(estimated_prev_sdf * inv_s)
         next_cdf = torch.sigmoid(estimated_next_sdf * inv_s)
-
+    
         p = prev_cdf - next_cdf
         c = prev_cdf
-
+    
         alpha = ((p + 1e-5) / (c + 1e-5)).reshape(batch_size, n_samples).clip(0.0, 1.0)
-
+    
         pts_norm = torch.linalg.norm(pts, ord=2, dim=-1, keepdim=True).reshape(batch_size, n_samples)
         inside_sphere = (pts_norm < 1.0).float().detach()
         relax_inside_sphere = (pts_norm < 1.2).float().detach()
-
+    
         # Render with background
         if background_alpha is not None:
             alpha = alpha * inside_sphere + background_alpha[:, :n_samples] * (1.0 - inside_sphere)
             alpha = torch.cat([alpha, background_alpha[:, n_samples:]], dim=-1)
-
+    
         weights = alpha * torch.cumprod(torch.cat([torch.ones([batch_size, 1]), 1. - alpha + 1e-7], -1), -1)[:, :-1]
         sampled_normals = gradients.reshape(batch_size, n_samples, 3)
-
+    
         # Eikonal loss
         gradient_error = (torch.linalg.norm(gradients.reshape(batch_size, n_samples, 3), ord=2,
                                             dim=-1) - 1.0) ** 2
         gradient_error = (relax_inside_sphere * gradient_error).sum() / (relax_inside_sphere.sum() + 1e-5)
-
+    
         return {
             'sdf': sdf,
             'dists': dists,
@@ -553,74 +611,34 @@ class NeuSRenderer:
             'sampled_normal' : sampled_normals
         }
 
-    def render(self, rays_o, rays_d, near, far, perturb_overwrite=-1, background_rgb=None, cos_anneal_ratio=0.0):
-        batch_size = len(rays_o)
-        sample_dist = 2.0 / self.n_samples   # Assuming the region of interest is a unit sphere
-        z_vals = torch.linspace(0.0, 1.0, self.n_samples)
-        z_vals = near + (far - near) * z_vals[None, :]
+    def render(self, rays_o, rays_d, z_vals, background_rgb=None, cos_anneal_ratio=0.0):
+        batch_size, n_samples = z_vals.shape
 
-        z_vals_outside = None
-        if self.n_outside > 0:
-            z_vals_outside = torch.linspace(1e-3, 1.0 - 1.0 / (self.n_outside + 1.0), self.n_outside)
+        # Section length
+        dists = z_vals[..., 1:] - z_vals[..., :-1]
+        dists = torch.cat([dists, torch.Tensor([1e10]).expand(dists[..., :1].shape)], -1)
+        dists = dists * torch.norm(rays_d[..., None, :], dim=-1)
 
-        n_samples = self.n_samples
-        perturb = self.perturb
+        # Section midpoints
+        mid_z_vals = z_vals + dists * 0.5
 
-        if perturb_overwrite >= 0:
-            perturb = perturb_overwrite
-        if perturb > 0:
-            t_rand = (torch.rand([batch_size, 1]) - 0.5)
-            z_vals = z_vals + t_rand * 2.0 / self.n_samples
-
-            if self.n_outside > 0:
-                mids = .5 * (z_vals_outside[..., 1:] + z_vals_outside[..., :-1])
-                upper = torch.cat([mids, z_vals_outside[..., -1:]], -1)
-                lower = torch.cat([z_vals_outside[..., :1], mids], -1)
-                t_rand = torch.rand([batch_size, z_vals_outside.shape[-1]])
-                z_vals_outside = lower[None, :] + (upper - lower)[None, :] * t_rand
-
-        if self.n_outside > 0:
-            z_vals_outside = far / torch.flip(z_vals_outside, dims=[-1]) + 1.0 / self.n_samples
-
+        # Render core
         background_alpha = None
         background_sampled_color = None
 
-        # Up sample
-        if self.n_importance > 0:
-            with torch.no_grad():
-                pts = rays_o[:, None, :] + rays_d[:, None, :] * z_vals[..., :, None]
-                sdf = self.sdf_network.sdf(pts.reshape(-1, 3)).reshape(batch_size, self.n_samples)
-
-                for i in range(self.up_sample_steps):
-                    new_z_vals = self.up_sample(rays_o,
-                                                rays_d,
-                                                z_vals,
-                                                sdf,
-                                                self.n_importance // self.up_sample_steps,
-                                                64 * 2**i)
-                    z_vals, sdf = self.cat_z_vals(rays_o,
-                                                  rays_d,
-                                                  z_vals,
-                                                  new_z_vals,
-                                                  sdf,
-                                                  last=(i + 1 == self.up_sample_steps))
-
-            n_samples = self.n_samples + self.n_importance
-
-        # Background model
         if self.n_outside > 0:
+            z_vals_outside = torch.linspace(z_vals[:, -1], z_vals[:, -1] + 1e3, self.n_outside)
             z_vals_feed = torch.cat([z_vals, z_vals_outside], dim=-1)
             z_vals_feed, _ = torch.sort(z_vals_feed, dim=-1)
-            ret_outside = self.render_core_outside(rays_o, rays_d, z_vals_feed, sample_dist, self.nerf)
+            ret_outside = self.render_core_outside(rays_o, rays_d, z_vals_feed, dists[:, 0], self.nerf)
 
             background_sampled_color = ret_outside['sampled_color']
             background_alpha = ret_outside['alpha']
 
-        # Render core
         ret_fine = self.render_core(rays_o,
                                     rays_d,
                                     z_vals,
-                                    sample_dist,
+                                    dists,
                                     self.sdf_network,
                                     self.deviation_network,
                                     self.color_network,
@@ -825,74 +843,26 @@ class NeuSRenderer:
             'inside_sphere': ret_fine['inside_sphere']
         }
 
-    def render_rnb_warmup(self, rays_o, rays_d, near, far, lights_dir, perturb_overwrite=-1, background_rgb=None, cos_anneal_ratio=0.0, no_albedo=False):
-        batch_size = len(rays_o)
-        sample_dist = 2.0 / self.n_samples   # Assuming the region of interest is a unit sphere
-        z_vals = torch.linspace(0.0, 1.0, self.n_samples)
-        z_vals = near + (far - near) * z_vals[None, :]
-
-        z_vals_outside = None
-        if self.n_outside > 0:
-            z_vals_outside = torch.linspace(1e-3, 1.0 - 1.0 / (self.n_outside + 1.0), self.n_outside)
-
-        n_samples = self.n_samples
-        perturb = self.perturb
-
-        if perturb_overwrite >= 0:
-            perturb = perturb_overwrite
-        if perturb > 0:
-            t_rand = (torch.rand([batch_size, 1]) - 0.5)
-            z_vals = z_vals + t_rand * 2.0 / self.n_samples
-
-            if self.n_outside > 0:
-                mids = .5 * (z_vals_outside[..., 1:] + z_vals_outside[..., :-1])
-                upper = torch.cat([mids, z_vals_outside[..., -1:]], -1)
-                lower = torch.cat([z_vals_outside[..., :1], mids], -1)
-                t_rand = torch.rand([batch_size, z_vals_outside.shape[-1]])
-                z_vals_outside = lower[None, :] + (upper - lower)[None, :] * t_rand
-
-        if self.n_outside > 0:
-            z_vals_outside = far / torch.flip(z_vals_outside, dims=[-1]) + 1.0 / self.n_samples
-
+    def render_rnb_warmup(self, rays_o, rays_d, z_vals, lights_dir, background_rgb=None, cos_anneal_ratio=0.0, no_albedo=False):
+        batch_size, n_samples = z_vals.shape
+    
         background_alpha = None
         background_sampled_color = None
-
-        # Up sample
-        if self.n_importance > 0:
-            with torch.no_grad():
-                pts = rays_o[:, None, :] + rays_d[:, None, :] * z_vals[..., :, None]
-                sdf = self.sdf_network.sdf(pts.reshape(-1, 3)).reshape(batch_size, self.n_samples)
-
-                for i in range(self.up_sample_steps):
-                    new_z_vals = self.up_sample(rays_o,
-                                                rays_d,
-                                                z_vals,
-                                                sdf,
-                                                self.n_importance // self.up_sample_steps,
-                                                64 * 2**i)
-                    z_vals, sdf = self.cat_z_vals(rays_o,
-                                                  rays_d,
-                                                  z_vals,
-                                                  new_z_vals,
-                                                  sdf,
-                                                  last=(i + 1 == self.up_sample_steps))
-
-            n_samples = self.n_samples + self.n_importance
-
+    
         # Background model
         if self.n_outside > 0:
             z_vals_feed = torch.cat([z_vals, z_vals_outside], dim=-1)
             z_vals_feed, _ = torch.sort(z_vals_feed, dim=-1)
-            ret_outside = self.render_core_outside(rays_o, rays_d, z_vals_feed, sample_dist, self.nerf)
-
+            ret_outside = self.render_core_outside(rays_o, rays_d, z_vals_feed, z_vals_feed[..., 1:] - z_vals_feed[..., :-1], self.nerf)
+    
             background_sampled_color = ret_outside['sampled_color']
             background_alpha = ret_outside['alpha']
-
+    
         # Render core
         ret_fine = self.render_core_mvps(rays_o,
                                     rays_d,
                                     z_vals,
-                                    sample_dist,
+                                    z_vals[..., 1:] - z_vals[..., :-1],
                                     self.sdf_network,
                                     self.deviation_network,
                                     self.color_network,
@@ -900,126 +870,23 @@ class NeuSRenderer:
                                     background_alpha=background_alpha,
                                     background_sampled_color=background_sampled_color,
                                     cos_anneal_ratio=cos_anneal_ratio)
-        
+    
         albedo = ret_fine['sampled_albedo']
         if no_albedo:
             albedo = torch.ones_like(ret_fine['sampled_albedo'])
         normal = ret_fine['sampled_normal']
         weights = ret_fine['weights']
-
+    
         directions = lights_dir * torch.ones(lights_dir.shape[0], batch_size, n_samples, 3) # n_lights, batch_size, n_samples, 3
-
+    
         relu = nn.ReLU()
         shading_fine = relu((normal[None,:,:,:] * directions).sum(dim=-1, keepdim=True))
         color_fine = (albedo[None, :, :, :] * weights[None, :, :, None] * shading_fine).sum(dim=2)
-
-        weights_sum = weights.sum(dim=-1, keepdim=True)
-        gradients = ret_fine['gradients']
-        s_val = ret_fine['s_val'].reshape(batch_size, n_samples).mean(dim=-1, keepdim=True)
-
-        return {
-            'color_fine': color_fine,
-            's_val': s_val,
-            'cdf_fine': ret_fine['cdf'],
-            'weight_sum': weights_sum,
-            'weight_max': torch.max(weights, dim=-1, keepdim=True)[0],
-            'gradients': gradients,
-            'weights': weights,
-            'gradient_error': ret_fine['gradient_error'],
-            'inside_sphere': ret_fine['inside_sphere']
-        }
     
-    def render_rnb(self, rays_o, rays_d, near, far, lights_dir, perturb_overwrite=-1, background_rgb=None, cos_anneal_ratio=0.0, no_albedo=False):
-        batch_size = len(rays_o)
-        sample_dist = 2.0 / self.n_samples   # Assuming the region of interest is a unit sphere
-        z_vals = torch.linspace(0.0, 1.0, self.n_samples)
-        z_vals = near + (far - near) * z_vals[None, :]
-
-        z_vals_outside = None
-        if self.n_outside > 0:
-            z_vals_outside = torch.linspace(1e-3, 1.0 - 1.0 / (self.n_outside + 1.0), self.n_outside)
-
-        n_samples = self.n_samples
-        perturb = self.perturb
-
-        if perturb_overwrite >= 0:
-            perturb = perturb_overwrite
-        if perturb > 0:
-            t_rand = (torch.rand([batch_size, 1]) - 0.5)
-            z_vals = z_vals + t_rand * 2.0 / self.n_samples
-
-            if self.n_outside > 0:
-                mids = .5 * (z_vals_outside[..., 1:] + z_vals_outside[..., :-1])
-                upper = torch.cat([mids, z_vals_outside[..., -1:]], -1)
-                lower = torch.cat([z_vals_outside[..., :1], mids], -1)
-                t_rand = torch.rand([batch_size, z_vals_outside.shape[-1]])
-                z_vals_outside = lower[None, :] + (upper - lower)[None, :] * t_rand
-
-        if self.n_outside > 0:
-            z_vals_outside = far / torch.flip(z_vals_outside, dims=[-1]) + 1.0 / self.n_samples
-
-        background_alpha = None
-        background_sampled_color = None
-
-        # Up sample
-        if self.n_importance > 0:
-            with torch.no_grad():
-                pts = rays_o[:, None, :] + rays_d[:, None, :] * z_vals[..., :, None]
-                sdf = self.sdf_network.sdf(pts.reshape(-1, 3)).reshape(batch_size, self.n_samples)
-
-                for i in range(self.up_sample_steps):
-                    new_z_vals = self.up_sample(rays_o,
-                                                rays_d,
-                                                z_vals,
-                                                sdf,
-                                                self.n_importance // self.up_sample_steps,
-                                                64 * 2**i)
-                    z_vals, sdf = self.cat_z_vals(rays_o,
-                                                  rays_d,
-                                                  z_vals,
-                                                  new_z_vals,
-                                                  sdf,
-                                                  last=(i + 1 == self.up_sample_steps))
-
-            n_samples = self.n_samples + self.n_importance
-
-        # Background model
-        if self.n_outside > 0:
-            z_vals_feed = torch.cat([z_vals, z_vals_outside], dim=-1)
-            z_vals_feed, _ = torch.sort(z_vals_feed, dim=-1)
-            ret_outside = self.render_core_outside(rays_o, rays_d, z_vals_feed, sample_dist, self.nerf)
-
-            background_sampled_color = ret_outside['sampled_color']
-            background_alpha = ret_outside['alpha']
-
-        # Render core
-        ret_fine = self.render_core_mvps(rays_o,
-                                    rays_d,
-                                    z_vals,
-                                    sample_dist,
-                                    self.sdf_network,
-                                    self.deviation_network,
-                                    self.color_network,
-                                    background_rgb=background_rgb,
-                                    background_alpha=background_alpha,
-                                    background_sampled_color=background_sampled_color,
-                                    cos_anneal_ratio=cos_anneal_ratio)
-
-        albedo = ret_fine['sampled_albedo']
-        if no_albedo:
-            albedo = torch.ones_like(ret_fine['sampled_albedo'])
-        normal = ret_fine['sampled_normal']
-        weights = ret_fine['weights']
-
-        directions = lights_dir * torch.ones(lights_dir.shape[0], batch_size, n_samples, 3) # n_lights, batch_size, n_samples, 3
-
-        shading_fine = (normal[None,:,:,:] * directions).sum(dim=-1, keepdim=True)
-        color_fine = (albedo[None, :, :, :] * weights[None, :, :, None] * shading_fine).sum(dim=2)
-
         weights_sum = weights.sum(dim=-1, keepdim=True)
         gradients = ret_fine['gradients']
         s_val = ret_fine['s_val'].reshape(batch_size, n_samples).mean(dim=-1, keepdim=True)
-
+    
         return {
             'color_fine': color_fine,
             's_val': s_val,
@@ -1031,6 +898,109 @@ class NeuSRenderer:
             'gradient_error': ret_fine['gradient_error'],
             'inside_sphere': ret_fine['inside_sphere']
         }
+        
+        def render_rnb(self, rays_o, rays_d, near, far, lights_dir, perturb_overwrite=-1, background_rgb=None, cos_anneal_ratio=0.0, no_albedo=False):
+            batch_size = len(rays_o)
+            sample_dist = 2.0 / self.n_samples   # Assuming the region of interest is a unit sphere
+            z_vals = torch.linspace(0.0, 1.0, self.n_samples)
+            z_vals = near + (far - near) * z_vals[None, :]
+    
+            z_vals_outside = None
+            if self.n_outside > 0:
+                z_vals_outside = torch.linspace(1e-3, 1.0 - 1.0 / (self.n_outside + 1.0), self.n_outside)
+    
+            n_samples = self.n_samples
+            perturb = self.perturb
+    
+            if perturb_overwrite >= 0:
+                perturb = perturb_overwrite
+            if perturb > 0:
+                t_rand = (torch.rand([batch_size, 1]) - 0.5)
+                z_vals = z_vals + t_rand * 2.0 / self.n_samples
+    
+                if self.n_outside > 0:
+                    mids = .5 * (z_vals_outside[..., 1:] + z_vals_outside[..., :-1])
+                    upper = torch.cat([mids, z_vals_outside[..., -1:]], -1)
+                    lower = torch.cat([z_vals_outside[..., :1], mids], -1)
+                    t_rand = torch.rand([batch_size, z_vals_outside.shape[-1]])
+                    z_vals_outside = lower[None, :] + (upper - lower)[None, :] * t_rand
+    
+            if self.n_outside > 0:
+                z_vals_outside = far / torch.flip(z_vals_outside, dims=[-1]) + 1.0 / self.n_samples
+    
+            background_alpha = None
+            background_sampled_color = None
+    
+            # Up sample
+            if self.n_importance > 0:
+                with torch.no_grad():
+                    pts = rays_o[:, None, :] + rays_d[:, None, :] * z_vals[..., :, None]
+                    sdf = self.sdf_network.sdf(pts.reshape(-1, 3)).reshape(batch_size, self.n_samples)
+    
+                    for i in range(self.up_sample_steps):
+                        new_z_vals = self.up_sample(rays_o,
+                                                    rays_d,
+                                                    z_vals,
+                                                    sdf,
+                                                    self.n_importance // self.up_sample_steps,
+                                                    64 * 2**i)
+                        z_vals, sdf = self.cat_z_vals(rays_o,
+                                                      rays_d,
+                                                      z_vals,
+                                                      new_z_vals,
+                                                      sdf,
+                                                      last=(i + 1 == self.up_sample_steps))
+    
+                n_samples = self.n_samples + self.n_importance
+    
+            # Background model
+            if self.n_outside > 0:
+                z_vals_feed = torch.cat([z_vals, z_vals_outside], dim=-1)
+                z_vals_feed, _ = torch.sort(z_vals_feed, dim=-1)
+                ret_outside = self.render_core_outside(rays_o, rays_d, z_vals_feed, sample_dist, self.nerf)
+    
+                background_sampled_color = ret_outside['sampled_color']
+                background_alpha = ret_outside['alpha']
+    
+            # Render core
+            ret_fine = self.render_core_mvps(rays_o,
+                                        rays_d,
+                                        z_vals,
+                                        sample_dist,
+                                        self.sdf_network,
+                                        self.deviation_network,
+                                        self.color_network,
+                                        background_rgb=background_rgb,
+                                        background_alpha=background_alpha,
+                                        background_sampled_color=background_sampled_color,
+                                        cos_anneal_ratio=cos_anneal_ratio)
+    
+            albedo = ret_fine['sampled_albedo']
+            if no_albedo:
+                albedo = torch.ones_like(ret_fine['sampled_albedo'])
+            normal = ret_fine['sampled_normal']
+            weights = ret_fine['weights']
+    
+            directions = lights_dir * torch.ones(lights_dir.shape[0], batch_size, n_samples, 3) # n_lights, batch_size, n_samples, 3
+    
+            shading_fine = (normal[None,:,:,:] * directions).sum(dim=-1, keepdim=True)
+            color_fine = (albedo[None, :, :, :] * weights[None, :, :, None] * shading_fine).sum(dim=2)
+    
+            weights_sum = weights.sum(dim=-1, keepdim=True)
+            gradients = ret_fine['gradients']
+            s_val = ret_fine['s_val'].reshape(batch_size, n_samples).mean(dim=-1, keepdim=True)
+    
+            return {
+                'color_fine': color_fine,
+                's_val': s_val,
+                'cdf_fine': ret_fine['cdf'],
+                'weight_sum': weights_sum,
+                'weight_max': torch.max(weights, dim=-1, keepdim=True)[0],
+                'gradients': gradients,
+                'weights': weights,
+                'gradient_error': ret_fine['gradient_error'],
+                'inside_sphere': ret_fine['inside_sphere']
+            }
 
 
     def render_normal_integration_light_optimal(self, rays_o, rays_d, near, far, l_directions, perturb_overwrite=-1, background_rgb=None, cos_anneal_ratio=0.0,ind=-1,mask=-1):
