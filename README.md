@@ -3,33 +3,47 @@
 dataset.py:
 
 Added self.density_scale parameter in the __init__ method to control the opacity of the volume during rendering.
+
 Modified the gen_random_rays_at method to return z_vals along with other data.
+
 Added the get_z_vals method to generate z_vals based on the camera distance.
 
 
 exp_runner.py:
 
 Updated the train_rnb method to use the modified gen_random_rays_at method and pass z_vals to the rendering functions.
+
 Modified the train_rnb method to reshape z_vals to (batch_size, n_samples) before passing it to the rendering functions.
+
 Updated the validate_image method to use the get_z_vals method for generating z_vals.
+
 Modified the validate_image method to reshape z_vals to (batch_size, n_samples) and use the correct number of samples when computing normals.
+
 
 
 fields.py:
 
 Added a new parameter density_scale to the __init__ method of the SDFNetwork class to control the opacity of the volume during rendering.
+
 Added the density_scale attribute to the SDFNetwork class.
 
 
 renderer.py:
 
 Removed the up_sample method and related code in the rendering functions.
+
 Added the density_scale parameter in the __init__ method of the NeuSRenderer class.
+
 Modified the render_core method to use the density_scale parameter when calculating alpha values.
+
 Updated the rendering functions (render, render_rnb_warmup, render_rnb) to accept z_vals as a parameter instead of generating them internally.
+
 Adjusted the render function to handle the case when n_outside > 0 and generate z_vals_outside accordingly.
+
 Modified the render_rnb_warmup and render_rnb methods to handle the case when background_alpha is not defined.
+
 Updated the render_core_mvps method to calculate dists using the distance between adjacent z_vals instead of sample_dist.
+
 Added the missing render_rnb method to the NeuSRenderer class.
 
 
